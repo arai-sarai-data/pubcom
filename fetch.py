@@ -16,44 +16,68 @@ def jdate(s):
     return dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
 
 
+def post_list(mode, page):
+    """一覧はフォームのPOSTでページ送りする（Mode 1=結果公示案件 / 2=過去案件、1ページ100件）。"""
+    import json as _j
+    cache = oc.RAW / "cache" / ("pcm_%d_%d.html" % (mode, page))
+    if cache.exists() and cache.stat().st_size > 1000 and page > 3:
+        return cache.read_text(encoding="utf-8")
+    data = {"CLASSNAME": "PCMMSTLIST", "Page": str(page), "Mode": str(mode), "Type": "0", "bMode": "0",
+            "sortItem": "0", "sortButton": "1", "dspcnt": "100", "keywordOr": "0"}
+    err = None
+    for i in range(4):
+        oc._polite(LIST)
+        try:
+            r = oc._session.post(LIST, data=data, timeout=120)
+            r.raise_for_status()
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_text(r.text, encoding="utf-8")
+            return r.text
+        except Exception as e:
+            err = e
+    raise oc.DataError("一覧の取得に失敗: Mode=%d Page=%d (%s)" % (mode, page, err))
+
+
+def cell(blk, label):
+    m = re.search(label + r"</span>\s*(?:<span>)?([^<]*)", blk)
+    return m.group(1).strip() if m else ""
+
+
 def parse(html):
-    """一覧の1件ずつ：案件名・案件番号・案の公示日・結果の公示日・提出意見数・所管省庁。"""
-    text = re.sub(r"<script.*?</script>|<style.*?</style>", "", html, flags=re.S)
     items = []
-    for blk in re.split(r"<li[ >]", text)[1:]:
-        t = re.sub(r"<[^>]+>", "\n", blk)
-        t = re.sub(r"[ \t　]+", " ", t)
-        lines = [x.strip() for x in t.split("\n") if x.strip()]
-        joined = " ".join(lines)
-        no = re.search(r"案件番号\s*(\d{9})", joined)
-        if not no:
+    for blk in re.split(r'<li class="egovui-flex-column">', html)[1:]:
+        no = cell(blk, "案件番号")
+        if not re.fullmatch(r"\d{9}", no):
             continue
-        m = re.search(r'href="([^"]*?(?:CLASSNAME=PCMMSTDETAIL|/pcm/detail)[^"]*)"', blk)
-        title = next((x for x in lines if len(x) > 12 and not re.match(r"(案件番号|結果|案の|提出|所管|受付|NEW|募集)", x)), "")
-        cnt = re.search(r"提出意見数\s*([\d,]+)", joined)
-        org = re.search(r"所管省庁\s*(\S+)", joined)
-        items.append({"no": no.group(1), "title": title, "url": (BASE + m.group(1).replace("&amp;", "&")) if m else "",
-                      "plan": jdate((re.search(r"案の公示日\s*(\S+)", joined) or [None, ""])[1]),
-                      "result": jdate((re.search(r"結果の公示日\s*(\S+)", joined) or [None, ""])[1]),
-                      "n": int(cnt.group(1).replace(",", "")) if cnt else None, "org": org.group(1) if org else ""})
+        t = re.search(r'<h2[^>]*>\s*<a[^>]*>(.*?)</a>', blk, re.S)
+        mode = re.search(r"id=(\d+)&amp;Mode=(\d)", blk)
+        n = cell(blk, "提出意見数").replace(",", "")
+        items.append({"no": no, "title": re.sub(r"\s+", " ", t.group(1)).strip() if t else "",
+                      "url": (BASE + "/pcm/1040?CLASSNAME=PCM1040&id=%s&Mode=%s" % mode.groups()) if mode else "",
+                      "plan": jdate(cell(blk, "案の公示日")), "result": jdate(cell(blk, "結果の公示日")),
+                      "n": int(n) if n.isdigit() else None, "org": cell(blk, "所管省庁")})
     return items
 
 
 def run():
-    seen = {}
-    for itype in ("2", "3"):  # 結果公示案件・過去案件（画面のタブの順）
-        empty = 0
-        for page in range(1, MAX_PAGES + 1):
-            html = oc.decode(oc.get(LIST, params={"indexType": itype, "pageNo": page, "pageSize": 100, "sortType": 1},
-                                    cache="pcm_%s_%d.html" % (itype, page)))
-            items = [x for x in parse(html) if x["n"] is not None]
-            new = [x for x in items if x["no"] not in seen]
-            for x in new:
-                seen[x["no"]] = x
-            oc.log("type", itype, "page", page, "items", len(items), "new", len(new), "total", len(seen))
-            empty = empty + 1 if not new else 0
-            if empty >= 2:
+    seen, held_none = {}, 0
+    for mode in (1, 2):
+        first = post_list(mode, 1)
+        tot = re.search(r"/\s*(\d+)\s*</", re.sub(r"\s+", " ", first))
+        last = re.findall(r'name="totalPage" value="(\d+)"', first)
+        pages = int(last[0]) if last else MAX_PAGES
+        oc.log("mode", mode, "pages", pages)
+        for page in range(1, min(pages, MAX_PAGES) + 1):
+            items = parse(first if page == 1 else post_list(mode, page))
+            if not items or all(x["no"] in seen for x in items if x["n"] is not None) and page > 1:
                 break
+            for x in items:
+                if x["n"] is None:
+                    held_none += 1
+                    continue          # 「－」＝意見公募を実施しなかった案件などは数えない
+                seen.setdefault(x["no"], x)
+            if page % 20 == 0:
+                oc.log("mode", mode, "page", page, "total", len(seen))
     rows = list(seen.values())
     oc.check(len(rows) > 3000, "パブコメの件数が少なすぎます(%d)。一覧の形式が変わった可能性" % len(rows))
     oc.check(sum(1 for r in rows if r["org"]) > len(rows) * 0.9, "所管省庁が取れていません")
@@ -78,7 +102,7 @@ def run():
         r["result"] = r["result"].isoformat() if r["result"] else ""
         r["plan"] = r["plan"].isoformat() if r["plan"] else ""
     meth = ("e-Govパブリック・コメントの「結果公示案件」「過去案件」の一覧に載っている提出意見数をそのまま数えました。"
-            "意見公募をしなかった理由の公示（提出意見数0）も一覧に含まれます。意見の数は、案に対する関心の高さや周知の度合いで大きく変わります。")
+            "提出意見数が「－」の案件（意見公募を実施しなかった理由の公示など）は数えていません。意見の数は、案に対する関心の高さや周知の度合いで大きく変わります。")
     R = [{"id": "zero", "tab": "意見0件", "title": "提出意見が0件だった案件の割合が高い府省",
           "desc": "パブコメを実施しても、誰からも意見が届かなかった案件の割合（30件以上の府省）。", "rows": zero, "method": meth,
           "columns": [{"key": "org", "label": "府省"}, {"key": "zero", "label": "意見0件の割合", "type": "num", "fmt": "pct", "bar": True},
