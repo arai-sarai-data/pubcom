@@ -17,13 +17,14 @@ def jdate(s):
 
 
 def post_list(mode, page):
-    """一覧はフォームのPOSTでページ送りする（Mode 1=結果公示案件 / 2=過去案件、1ページ100件）。"""
+    """一覧はフォームのPOSTでページ送りする（Mode 1=結果公示案件 / 2=過去案件、1ページ100件）。
+    sortItem=1（公示日順）。0にすると意見数「－」の案件が先に並び、意見数が読めない。"""
     import json as _j
-    cache = oc.RAW / "cache" / ("pcm_%d_%d.html" % (mode, page))
+    cache = oc.RAW / "cache" / ("pcm_s1_%d_%d.html" % (mode, page))
     if cache.exists() and cache.stat().st_size > 1000 and page > 3:
         return cache.read_text(encoding="utf-8")
-    data = {"CLASSNAME": "PCMMSTLIST", "Page": str(page), "Mode": str(mode), "Type": "0", "bMode": "0",
-            "sortItem": "0", "sortButton": "1", "dspcnt": "100", "keywordOr": "0"}
+    data = {"CLASSNAME": "PCMMSTLIST", "Page": str(page), "Mode": str(mode), "Type": "0", "bMode": "1",
+            "sortItem": "1", "sortButton": "1", "dspcnt": "100", "keywordOr": "0"}
     err = None
     for i in range(4):
         oc._polite(LIST)
@@ -64,12 +65,12 @@ def run():
     for mode in (1, 2):
         first = post_list(mode, 1)
         tot = re.search(r"/\s*(\d+)\s*</", re.sub(r"\s+", " ", first))
-        last = re.findall(r'name="totalPage" value="(\d+)"', first)
+        last = re.findall(r'id="totalPage" value="(\d+)"', first) or re.findall(r'name="totalPage" value="(\d+)"', first)
         pages = int(last[0]) if last else MAX_PAGES
         oc.log("mode", mode, "pages", pages)
         for page in range(1, min(pages, MAX_PAGES) + 1):
             items = parse(first if page == 1 else post_list(mode, page))
-            if not items or all(x["no"] in seen for x in items if x["n"] is not None) and page > 1:
+            if not items:
                 break
             for x in items:
                 if x["n"] is None:
